@@ -23,6 +23,8 @@ namespace CampusNetAutoLogin
         private static string portalHost = "1.1.1.1";
         private static int portalPort = 801;
         private static int loginAttempts = 20;
+        private static bool hotspotAfterConnect = true;
+        private static int hotspotDelaySeconds = 30;
 
         private static readonly string UserAgent =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -41,25 +43,82 @@ namespace CampusNetAutoLogin
 
             string exePath = Application.ExecutablePath;
             string exeDir = Path.GetDirectoryName(exePath);
-            string logFile = Path.Combine(exeDir, "CampusNetAutoLogin.log");
-            LoadConfig(exeDir);
-
             string startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
             string startupExe = Path.Combine(startupDir, Path.GetFileName(exePath));
+            bool runningFromStartup = String.Equals(exePath, startupExe, StringComparison.OrdinalIgnoreCase);
+
+            string dataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "CampusNetAutoLogin");
+            Directory.CreateDirectory(dataDir);
+
+            string iniPath = Path.Combine(dataDir, IniName);
+            string logFile = Path.Combine(dataDir, "CampusNetAutoLogin.log");
+
+            MigrateLegacyFiles(exeDir, runningFromStartup, iniPath, logFile);
+            LoadConfig(iniPath);
 
             // Windows started this copy from the Startup folder -> run silently.
-            if (String.Equals(exePath, startupExe, StringComparison.OrdinalIgnoreCase))
+            if (runningFromStartup)
             {
-                RunAutoLogin(logFile, loginAttempts, true);
+                bool ok = RunAutoLogin(logFile, loginAttempts, true);
+                if (ok && hotspotAfterConnect)
+                {
+                    Log(logFile, "Waiting " + hotspotDelaySeconds + " seconds before enabling mobile hotspot.");
+                    Thread.Sleep(hotspotDelaySeconds * 1000);
+                    StartMobileHotspot(logFile);
+                }
                 return;
             }
 
-            Application.Run(new ControlPanel(exePath, exeDir, logFile));
+            Application.Run(new ControlPanel(exePath, dataDir, iniPath, logFile));
         }
 
-        private static void LoadConfig(string dir)
+        private static void MigrateLegacyFiles(string exeDir, bool runningFromStartup, string iniPath, string logFile)
         {
-            string path = Path.Combine(dir, IniName);
+            string legacyIni = Path.Combine(exeDir, IniName);
+            string legacyLog = Path.Combine(exeDir, "CampusNetAutoLogin.log");
+
+            try
+            {
+                if (!File.Exists(iniPath) && File.Exists(legacyIni))
+                {
+                    File.Copy(legacyIni, iniPath, true);
+                }
+                if (!File.Exists(logFile) && File.Exists(legacyLog))
+                {
+                    File.Copy(legacyLog, logFile, true);
+                }
+            }
+            catch
+            {
+            }
+
+            // The Startup folder must contain the exe only. Windows will open
+            // any ini/log file placed there, which caused an extra window.
+            if (runningFromStartup)
+            {
+                DeleteIfExists(legacyIni);
+                DeleteIfExists(legacyLog);
+            }
+        }
+
+        private static void DeleteIfExists(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void LoadConfig(string path)
+        {
             if (!File.Exists(path))
             {
                 return;
@@ -118,6 +177,24 @@ namespace CampusNetAutoLogin
                             if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) && parsed > 0)
                             {
                                 loginAttempts = parsed;
+                            }
+                        }
+                        break;
+                    case "hotspot_after_connect":
+                        {
+                            bool parsed;
+                            if (bool.TryParse(value, out parsed))
+                            {
+                                hotspotAfterConnect = parsed;
+                            }
+                        }
+                        break;
+                    case "hotspot_delay_seconds":
+                        {
+                            int parsed;
+                            if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed) && parsed >= 0)
+                            {
+                                hotspotDelaySeconds = parsed;
                             }
                         }
                         break;
@@ -355,15 +432,67 @@ namespace CampusNetAutoLogin
             }
         }
 
+        private static bool StartMobileHotspot(string logFile)
+        {
+            string script =
+                "$ErrorActionPreference='Stop'\r\n" +
+                "Add-Type -AssemblyName System.Runtime.WindowsRuntime\r\n" +
+                "$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]\r\n" +
+                "function Await($WinRtTask, $ResultType) {\r\n" +
+                "  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)\r\n" +
+                "  $netTask = $asTask.Invoke($null, @($WinRtTask))\r\n" +
+                "  $netTask.Wait(-1) | Out-Null\r\n" +
+                "  $netTask.Result\r\n" +
+                "}\r\n" +
+                "[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null\r\n" +
+                "[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null\r\n" +
+                "$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()\r\n" +
+                "if ($null -eq $profile) { exit 2 }\r\n" +
+                "$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)\r\n" +
+                "$result = Await ($manager.StartTetheringAsync()) ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])\r\n" +
+                "if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) { exit 0 }\r\n" +
+                "exit 3\r\n";
+
+            try
+            {
+                string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+                ProcessStartInfo psi = new ProcessStartInfo(
+                    "powershell.exe",
+                    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand " + encoded);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+
+                using (Process p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(30000))
+                    {
+                        try { p.Kill(); } catch { }
+                        Log(logFile, "Mobile hotspot command timed out.");
+                        return false;
+                    }
+
+                    Log(logFile, "Mobile hotspot command exit code: " + p.ExitCode);
+                    return p.ExitCode == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log(logFile, "Could not enable mobile hotspot: " + ex.Message);
+                return false;
+            }
+        }
+
         private sealed class ControlPanel : Form
         {
             private readonly string sourceExe;
-            private readonly string exeDir;
+            private readonly string dataDir;
+            private readonly string iniPath;
             private readonly string logFile;
             private readonly string startupDir;
             private readonly string startupExe;
 
             private Label statusLabel;
+            private CheckBox hotspotCheckBox;
             private Button enableButton;
             private Button disableButton;
             private Button saveButton;
@@ -376,17 +505,18 @@ namespace CampusNetAutoLogin
             private readonly Color DangerColor = Color.FromArgb(196, 68, 68);
             private readonly Color AccentColor = Color.FromArgb(232, 157, 45);
 
-            public ControlPanel(string exePath, string exeDirectory, string logPath)
+            public ControlPanel(string exePath, string dataDirectory, string iniFile, string logPath)
             {
                 sourceExe = exePath;
-                exeDir = exeDirectory;
+                dataDir = dataDirectory;
+                iniPath = iniFile;
                 logFile = logPath;
                 startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
                 startupExe = Path.Combine(startupDir, Path.GetFileName(exePath));
 
                 Text = Title;
                 BackColor = Color.White;
-                ClientSize = new Size(500, 392);
+                ClientSize = new Size(500, 442);
                 FormBorderStyle = FormBorderStyle.FixedSingle;
                 StartPosition = FormStartPosition.CenterScreen;
                 MaximizeBox = false;
@@ -491,10 +621,17 @@ namespace CampusNetAutoLogin
                 testButton = MakeButton("立即登录测试", PrimaryColor, new Point(372, 250), new Size(112, 42));
                 testButton.Click += delegate { TestLogin(); };
 
+                hotspotCheckBox = new CheckBox();
+                hotspotCheckBox.Text = "登录成功后自动开启电脑移动热点（等待 30 秒）";
+                hotspotCheckBox.Location = new Point(22, 304);
+                hotspotCheckBox.Size = new Size(456, 26);
+                hotspotCheckBox.ForeColor = Color.FromArgb(70, 70, 70);
+                hotspotCheckBox.Checked = hotspotAfterConnect;
+
                 Label note = new Label();
-                note.Text = "修改账号密码后请点“保存账号密码”生效。想停用自启就点“关闭开机自启”。";
+                note.Text = "修改后请点“保存账号密码”生效。想停用自启就点“关闭开机自启”。";
                 note.ForeColor = Color.FromArgb(130, 130, 130);
-                note.Location = new Point(22, 312);
+                note.Location = new Point(22, 340);
                 note.Size = new Size(458, 24);
                 note.TextAlign = ContentAlignment.MiddleLeft;
 
@@ -502,6 +639,7 @@ namespace CampusNetAutoLogin
                 Controls.Add(disableButton);
                 Controls.Add(saveButton);
                 Controls.Add(testButton);
+                Controls.Add(hotspotCheckBox);
                 Controls.Add(note);
             }
 
@@ -539,12 +677,10 @@ namespace CampusNetAutoLogin
                     Directory.CreateDirectory(startupDir);
                     File.Copy(sourceExe, startupExe, true);
 
-                    string sourceIni = Path.Combine(exeDir, IniName);
-                    string destIni = Path.Combine(startupDir, IniName);
-                    if (File.Exists(sourceIni))
-                    {
-                        File.Copy(sourceIni, destIni, true);
-                    }
+                    // Keep only the exe in the Startup folder. Windows would
+                    // open a leftover ini/log file and show an extra window.
+                    DeleteIfExists(Path.Combine(startupDir, IniName));
+                    DeleteIfExists(Path.Combine(startupDir, "CampusNetAutoLogin.log"));
 
                     MessageBox.Show("已开启开机自启。\r\n以后每次开机登录 Windows 都会自动尝试登录校园网。",
                         Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -567,6 +703,8 @@ namespace CampusNetAutoLogin
                     {
                         File.Delete(startupExe);
                     }
+                    DeleteIfExists(Path.Combine(startupDir, IniName));
+                    DeleteIfExists(Path.Combine(startupDir, "CampusNetAutoLogin.log"));
 
                     MessageBox.Show("已关闭开机自启。\r\n不会再随 Windows 自动登录。",
                         Title, MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -595,14 +733,11 @@ namespace CampusNetAutoLogin
 
                 account = acc;
                 password = pwd;
+                hotspotAfterConnect = hotspotCheckBox.Checked;
 
                 try
                 {
-                    WriteSettingsFile(Path.Combine(exeDir, IniName));
-                    if (File.Exists(startupExe))
-                    {
-                        WriteSettingsFile(Path.Combine(startupDir, IniName));
-                    }
+                    WriteSettingsFile(iniPath);
 
                     MessageBox.Show("账号密码已保存。", Title,
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -628,6 +763,10 @@ namespace CampusNetAutoLogin
                 sb.AppendLine();
                 sb.AppendLine("# Retry every 2 seconds until the network is ready.");
                 sb.AppendLine("login_attempts=" + loginAttempts);
+                sb.AppendLine();
+                sb.AppendLine("# Enable the Windows mobile hotspot after a successful login.");
+                sb.AppendLine("hotspot_after_connect=" + (hotspotAfterConnect ? "true" : "false"));
+                sb.AppendLine("hotspot_delay_seconds=" + hotspotDelaySeconds);
 
                 string dir = Path.GetDirectoryName(path);
                 if (!String.IsNullOrEmpty(dir))
